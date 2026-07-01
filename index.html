@@ -438,8 +438,13 @@ body{font-family:var(--font);background:var(--bg);color:var(--ink);min-height:10
       <div class="section-head">
         <div>
           <h2>Novo projeto estratégico</h2>
-          <div class="sub">Preencha os campos abaixo — as dependências e o histórico são gerados automaticamente</div>
+          <div class="sub">Preencha os campos abaixo. Os dados ficam salvos localmente e podem ser exportados para a planilha.</div>
         </div>
+      </div>
+      <div style="background:var(--amber-l);border:1px solid var(--amber);border-radius:10px;padding:12px 16px;margin-bottom:24px;font-size:13px;color:var(--amber);display:flex;gap:10px;align-items:flex-start;max-width:720px;">
+        <span style="font-size:18px;flex-shrink:0;">💾</span>
+        <div><b>Onde os dados ficam salvos?</b><br>
+        Os projetos que você criar aqui ficam no seu navegador (localStorage). Para enviá-los à planilha Google, clique em <b>"Exportar para planilha"</b> após salvar — isso gera um JSON que o Apps Script da planilha importa automaticamente.</div>
       </div>
 
       <div class="card card-pad" style="max-width:720px;">
@@ -534,8 +539,9 @@ body{font-family:var(--font);background:var(--bg);color:var(--ink);min-height:10
           <textarea id="f-incorp" rows="2" placeholder="Registre incorporações do PE anterior..."></textarea>
         </div>
 
-        <div style="display:flex;gap:8px;margin-top:8px;">
+        <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap;">
           <button class="btn btn-primary" onclick="salvarProjeto()">Salvar projeto</button>
+          <button class="btn btn-success" onclick="exportarUltimoProjeto()">↗ Exportar para planilha</button>
           <button class="btn btn-ghost" onclick="limparForm()">Limpar</button>
         </div>
       </div>
@@ -700,30 +706,141 @@ async function lerAbaTecnico(nome){
   const url = `https://docs.google.com/spreadsheets/d/${state.sheetId}/gviz/tq?tqx=out:json&sheet=${encodeURIComponent(nome)}`;
   const r = await fetch(url);
   const txt = await r.text();
-  const json = JSON.parse(txt.match(/google\.visualization\.Query\.setResponse\(([\s\S]*)\)/)[1]);
-  const rows = json.table.rows || [];
+  const data = JSON.parse(txt.match(/google\.visualization\.Query\.setResponse\(([\s\S]*)\)/)[1]);
+  const rows = (data.table.rows || []).map(row =>
+    (row.c || []).map(c => (c && c.v != null ? String(c.v).trim() : ''))
+  );
 
-  // Lê projetos desta aba e atualiza state.projetos
-  rows.forEach(row => {
-    if(!row.c || !row.c[1]?.v) return;
-    const id = String(row.c[0]?.v || '').trim();
-    const nm = String(row.c[1]?.v || '').trim();
-    if(!nm || nm.toLowerCase().includes('projeto') && nm.length < 20) return;
-    if(!id) return;
+  // ── parser do layout vertical real da planilha ──────────────────
+  // Estrutura: coluna B = label (Projeto estratégico, Ações, Produtos...)
+  //            coluna C = valor / texto
+  //            colunas D/E/F = prazos (curto/médio/longo) quando existem
+  const projetosLidos = [];
+  let cur = null;
+  let modo = null; // 'acoes' | 'produtos' | 'incorp'
 
-    const existing = state.projetos.find(p => p.id === id && p.tecnico === nome);
-    if(!existing){
-      state.projetos.push({
-        id, nome: nm,
-        tecnico: nome,
-        eixo: String(row.c[2]?.v || '').trim(),
-        coord: String(row.c[7]?.v || '').trim(),
-        status: 'andamento',
-        descricao: String(row.c[3]?.v || '').trim(),
-        indicador: '',
-        prazos:{c: String(row.c[4]?.v||''), m: String(row.c[5]?.v||''), l: String(row.c[6]?.v||'')},
+  const cel = (row, col) => (rows[row] && rows[row][col]) ? rows[row][col] : '';
+  const limpa = s => s.replace(/<[^>]*>/g,'').replace(/\s+/g,' ').trim();
+
+  for(let i = 0; i < rows.length; i++){
+    const b = limpa(cel(i,1)); // coluna B
+    const c = limpa(cel(i,2)); // coluna C
+    const d = limpa(cel(i,3)); // coluna D
+    const e = limpa(cel(i,4)); // coluna E
+    const f = limpa(cel(i,5)); // coluna F
+
+    // Detecta início de novo projeto: "5.2 Projeto estratégico" em B
+    const projMatch = b.match(/^(\d+\.?\d*)\s+[Pp]rojeto/);
+    if(projMatch){
+      if(cur) projetosLidos.push(cur);
+      cur = {
+        id: projMatch[1],
+        nome: limpa(c) || b,
+        eixo: '', coord: '', status: 'andamento',
+        descricao: limpa(c),
+        indicador: '', meta: '', periodicidade: '',
+        prazos:{c:'',m:'',l:''},
         acoes:[], produtos:[], responsaveis:[], incorporacoes:'',
-      });
+        tecnico: nome,
+        origem: 'planilha',
+      };
+      modo = null;
+      continue;
+    }
+    if(!cur) continue;
+
+    // Coordenação — aparece como texto na coluna C da mesma linha do projeto
+    // ou linha com "Coordenação" em B/C
+    if(b.toLowerCase().includes('coordena') || c.toLowerCase().includes('coordena')){
+      const rawCoord = c.includes(':') ? c.split(':').slice(1).join(':').trim() : c;
+      if(rawCoord) cur.coord = limpa(rawCoord);
+      continue;
+    }
+
+    // Objetivo estratégico
+    if(b.toLowerCase().includes('objetivo')){
+      if(c) cur.descricao = c;
+      modo = null; continue;
+    }
+
+    // Indicador / Meta
+    if(b.toLowerCase().includes('indicador') || b.toLowerCase().includes('meta')){
+      if(c) cur.indicador = c;
+      modo = null; continue;
+    }
+
+    // Ações
+    if(b.toLowerCase() === 'ações' || b.toLowerCase() === 'acoes'){
+      modo = 'acoes';
+      if(c) cur.acoes.push(c);
+      continue;
+    }
+    if(modo === 'acoes' && !b && c){ cur.acoes.push(c); continue; }
+
+    // Produtos esperados
+    if(b.toLowerCase().includes('produto')){
+      modo = 'produtos';
+      if(c) cur.produtos.push(c);
+      continue;
+    }
+    if(modo === 'produtos' && !b && c){ cur.produtos.push(c); continue; }
+
+    // Incorporações
+    if(b.toLowerCase().includes('incorpora')){
+      modo = 'incorp';
+      if(c) cur.incorporacoes += (cur.incorporacoes?'\n':'')+c;
+      continue;
+    }
+    if(modo === 'incorp' && !b && c){ cur.incorporacoes += '\n'+c; continue; }
+
+    // Prazos — linha com Curto/Médio/Longo nas colunas
+    if(b.toLowerCase().includes('curto') || d.toLowerCase().includes('curto') ||
+       c.toLowerCase().includes('curto prazo')){
+      // Pode estar em diferentes layouts: B=Curto, C=valor OU D=Curto E=Médio F=Longo
+      if(d.toLowerCase().includes('curto')){ cur.prazos.c = e||''; cur.prazos.m = limpa(cel(i,5))||''; cur.prazos.l = limpa(cel(i,6))||''; }
+      else if(b) { cur.prazos.c = c; }
+      continue;
+    }
+    if(b.toLowerCase().includes('médio') || b.toLowerCase().includes('medio')){
+      cur.prazos.m = c; continue;
+    }
+    if(b.toLowerCase().includes('longo')){
+      cur.prazos.l = c; continue;
+    }
+
+    // Linha com "Curto Prazo", "Médio Prazo", "Longo Prazo" nos headers das colunas D/E/F
+    if(d.toLowerCase().includes('curto') && e.toLowerCase().includes('médio')){
+      // próxima linha tem os valores
+      const nd = limpa(cel(i+1,3)), ne = limpa(cel(i+1,4)), nf = limpa(cel(i+1,5));
+      if(nd||ne||nf){ cur.prazos.c=nd; cur.prazos.m=ne; cur.prazos.l=nf; i++; }
+      continue;
+    }
+
+    // Responsáveis — linha com nomes em C quando B contém "responsáv"
+    if(b.toLowerCase().includes('responsáv') || b.toLowerCase().includes('responsav')){
+      if(c) cur.responsaveis = c.split(/[,;]/).map(s=>s.trim()).filter(Boolean);
+      modo = null; continue;
+    }
+
+    // Periodicidade
+    if(b.toLowerCase().includes('periodicidade')){ if(c) cur.periodicidade=c; continue; }
+  }
+  if(cur) projetosLidos.push(cur);
+
+  // Mescla com state: preserva edições locais, adiciona novos da planilha
+  projetosLidos.forEach(p => {
+    const key = p.id + '::' + nome;
+    const existing = state.projetos.find(x => x.id === p.id && x.tecnico === nome && x.origem === 'planilha');
+    if(!existing){
+      state.projetos.push(p);
+    } else {
+      // Atualiza campos vindos da planilha sem sobrescrever edições locais
+      existing.nome = p.nome || existing.nome;
+      existing.descricao = p.descricao || existing.descricao;
+      existing.coord = p.coord || existing.coord;
+      if(p.acoes.length) existing.acoes = p.acoes;
+      if(p.produtos.length) existing.produtos = p.produtos;
+      if(p.prazos.c||p.prazos.m||p.prazos.l) existing.prazos = p.prazos;
     }
   });
   salvarLocal();
@@ -1019,11 +1136,13 @@ function salvarProjeto(){
     criadoEm: new Date().toLocaleString('pt-BR'),
   };
 
+  proj.origem = 'local';
   state.projetos.push(proj);
+  ultimoProjetoSalvo = proj;
   state.atividade.push({texto:`Projeto ${id} — ${nome} adicionado`, quando: new Date().toLocaleString('pt-BR'), tipo:'novo'});
   salvarLocal();
   limparForm();
-  toast('Projeto salvo com sucesso!','green');
+  toast('Projeto salvo! Clique em "Exportar para planilha" para enviar ao Sheets.','green');
   navTo('pg-projetos');
 }
 
@@ -1112,6 +1231,76 @@ function toast(msg, tipo=''){
   el.className = 'show ' + tipo;
   clearTimeout(toastTimer);
   toastTimer = setTimeout(()=>el.className='', 3500);
+}
+
+// ═══════════════════════════════════════════════════════
+// EXPORTAR PARA PLANILHA (via Apps Script endpoint)
+// ═══════════════════════════════════════════════════════
+let ultimoProjetoSalvo = null;
+
+function exportarUltimoProjeto(){
+  if(!ultimoProjetoSalvo){ toast('Salve um projeto primeiro','red'); return; }
+  const endpoint = state.scriptUrl;
+  if(!endpoint){
+    // Sem endpoint configurado: copia JSON para clipboard
+    const json = JSON.stringify(ultimoProjetoSalvo, null, 2);
+    navigator.clipboard.writeText(json).then(()=>{
+      toast('JSON copiado! Cole no Apps Script da planilha.','green');
+    });
+    abrirModalExport(ultimoProjetoSalvo);
+    return;
+  }
+  fetch(endpoint, {
+    method:'POST',
+    body: JSON.stringify(ultimoProjetoSalvo),
+  }).then(r=>r.json()).then(d=>{
+    toast('Projeto enviado para a planilha!','green');
+  }).catch(e=>{
+    toast('Erro ao enviar: '+e.message,'red');
+  });
+}
+
+function exportarTodosLocais(){
+  const locais = state.projetos.filter(p=>!p.origem || p.origem==='local');
+  if(!locais.length){ toast('Nenhum projeto local para exportar','red'); return; }
+  const json = JSON.stringify(locais, null, 2);
+  const blob = new Blob([json], {type:'application/json'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'projetos_locais.json';
+  a.click();
+  toast('Arquivo JSON baixado — importe na planilha via Apps Script','green');
+}
+
+function abrirModalExport(proj){
+  const div = document.createElement('div');
+  div.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:200;display:flex;align-items:center;justify-content:center;padding:20px;';
+  div.innerHTML=`<div style="background:#fff;border-radius:16px;padding:28px;max-width:560px;width:100%;max-height:80vh;overflow-y:auto;">
+    <h3 style="margin-bottom:8px;font-family:var(--display);">Exportar projeto para a planilha</h3>
+    <p style="font-size:13px;color:var(--ink3);margin-bottom:16px;">Você tem duas opções:</p>
+    <div style="background:var(--green-l);border-radius:8px;padding:14px;margin-bottom:12px;font-size:13px;">
+      <b>Opção 1 — Cole a URL do Apps Script</b><br>
+      No campo abaixo, cole a URL do seu app (aquela que termina em /exec). O sistema envia automaticamente.
+      <input type="text" id="exp-url" placeholder="https://script.google.com/macros/s/.../exec" style="width:100%;margin-top:8px;padding:8px;border:1px solid var(--border);border-radius:6px;font-size:12px;">
+      <button onclick="salvarEndpointEEnviar()" style="margin-top:8px;padding:8px 14px;background:var(--green);color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:12px;">Enviar agora</button>
+    </div>
+    <div style="background:var(--brand-l);border-radius:8px;padding:14px;font-size:13px;">
+      <b>Opção 2 — Baixar JSON</b><br>
+      Baixe o arquivo e importe manualmente na planilha.
+      <br><button onclick="exportarTodosLocais()" style="margin-top:8px;padding:8px 14px;background:var(--brand);color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:12px;">↓ Baixar JSON</button>
+    </div>
+    <button onclick="this.closest('div[style]').remove()" style="margin-top:16px;padding:8px 14px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;cursor:pointer;font-size:13px;">Fechar</button>
+  </div>`;
+  document.body.appendChild(div);
+  div.addEventListener('click', e=>{ if(e.target===div) div.remove(); });
+}
+
+function salvarEndpointEEnviar(){
+  const url = document.getElementById('exp-url')?.value?.trim();
+  if(!url){ toast('Cole a URL do Apps Script','red'); return; }
+  state.scriptUrl = url;
+  salvarLocal();
+  exportarUltimoProjeto();
 }
 
 // ═══════════════════════════════════════════════════════
