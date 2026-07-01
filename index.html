@@ -360,8 +360,11 @@ body{font-family:var(--font);background:var(--bg);color:var(--ink);min-height:10
     </div>
 
     <div class="sidebar-connect">
-      <p>Cole o link do Google Sheets (compartilhado como "Qualquer pessoa com o link pode ver")</p>
+      <p>Link da planilha</p>
       <input type="text" id="sheet-url" placeholder="https://docs.google.com/spreadsheets/d/...">
+      <p style="margin-top:10px;">Nomes das abas dos técnicos</p>
+      <input type="text" id="sheet-tabs" placeholder="ex: Daniele, Andrea, Carol" style="margin-top:4px;">
+      <div style="font-size:10px;color:rgba(255,255,255,.25);margin-top:4px;line-height:1.4;">Copie os nomes das abas da parte inferior da planilha, separados por vírgula. Ao adicionar uma nova aba lá, adicione o nome aqui também.</div>
       <button class="btn-connect" onclick="conectarPlanilha()">Conectar planilha</button>
     </div>
   </aside>
@@ -644,7 +647,10 @@ async function conectarPlanilha(){
   if(!url){toast('Cole o link da planilha primeiro','red');return;}
   const id = extrairId(url);
   if(!id){toast('Link inválido','red');return;}
+  const tabsRaw = document.getElementById('sheet-tabs').value.trim();
+  if(!tabsRaw){toast('Informe os nomes das abas','red');return;}
   state.sheetId = id;
+  state.tabsManual = tabsRaw.split(',').map(t=>t.trim()).filter(Boolean);
   salvarLocal();
   await sincronizar();
 }
@@ -666,26 +672,15 @@ async function sincronizar(){
 }
 
 async function lerSheets(){
-  // 1. Busca nomes das abas via feed público
-  const feedUrl = `https://spreadsheets.google.com/feeds/worksheets/${state.sheetId}/public/full?alt=json`;
-  const res = await fetch(feedUrl);
-  if(!res.ok) throw new Error('Planilha não acessível. Verifique se está compartilhada como "Qualquer pessoa com o link pode ver".');
-  const feed = await res.json();
-  const sheets = feed.feed.entry.map(e => e.title.$t);
-
-  state.tecnicos = sheets.filter(s => !['Modelo Padrão','Eixos','EIXOS','Dashboard','Instruções'].includes(s));
-
-  // 2. Lê aba "Eixos" se existir
-  if(sheets.includes('Eixos') || sheets.includes('EIXOS')){
-    const abaEixos = sheets.find(s => s.toLowerCase()==='eixos');
-    await lerAbaEixos(abaEixos);
-  }
-
-  // 3. Lê cada técnico
+  // Usa nomes das abas informados manualmente (campo Abas dos técnicos)
+  const tabs = state.tabsManual || [];
+  if(!tabs.length) throw new Error('Nenhuma aba informada. Preencha os nomes no campo do menu lateral.');
+  state.tecnicos = tabs;
   for(const tec of state.tecnicos){
     await lerAbaTecnico(tec);
   }
 }
+
 
 async function lerAbaEixos(nome){
   const url = `https://docs.google.com/spreadsheets/d/${state.sheetId}/gviz/tq?tqx=out:json&sheet=${encodeURIComponent(nome)}`;
@@ -1126,6 +1121,9 @@ carregarLocal();
 if(state.sheetId){
   document.getElementById('sheet-url').value = `https://docs.google.com/spreadsheets/d/${state.sheetId}`;
   document.getElementById('sync-status').textContent = '✓ Conectado';
+}
+if(state.tabsManual && state.tabsManual.length){
+  document.getElementById('sheet-tabs').value = state.tabsManual.join(', ');
 }
 renderSidebar();
 renderDashboard();
